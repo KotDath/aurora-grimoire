@@ -1,3 +1,6 @@
+mod fetch_web;
+mod struct_md;
+
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
@@ -29,40 +32,16 @@ pub enum RagCommand {
 
 #[derive(Debug, Args)]
 pub struct RagFetchWebArgs {
-    /// Documentation start URL
-    #[arg(long, value_name = "URL")]
-    pub start_url: Option<String>,
-
-    /// Directory for raw HTML output
-    #[arg(long, default_value = "data/raw/html")]
-    pub output_dir: PathBuf,
-
-    /// Maximum link traversal depth
-    #[arg(long, default_value_t = 8)]
-    pub max_depth: usize,
-
-    /// Allow crawling external domains
-    #[arg(long, default_value_t = false)]
-    pub follow_external: bool,
-
-    /// Overwrite existing files
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
+    /// Verbose crawler logs
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Args)]
 pub struct RagStructArgs {
-    /// Input directory with raw HTML
-    #[arg(long, default_value = "data/raw/html")]
-    pub input_dir: PathBuf,
-
-    /// Output directory for structured Markdown
-    #[arg(long, default_value = "data/structured/md")]
-    pub output_dir: PathBuf,
-
-    /// Overwrite existing Markdown files
-    #[arg(long, default_value_t = false)]
-    pub force: bool,
+    /// Verbose converter logs
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Args)]
@@ -137,10 +116,16 @@ pub struct RagClearArgs {
 pub fn run(args: RagArgs) {
     match args.command {
         RagCommand::FetchWeb(fetch) => {
-            println!("[stub] rag fetch-web: {fetch:#?}");
+            if let Err(err) = fetch_web::run(fetch) {
+                eprintln!("[error] rag fetch-web failed: {err:#}");
+                std::process::exit(1);
+            }
         }
         RagCommand::Struct(st) => {
-            println!("[stub] rag struct: {st:#?}");
+            if let Err(err) = struct_md::run(st) {
+                eprintln!("[error] rag struct failed: {err:#}");
+                std::process::exit(1);
+            }
         }
         RagCommand::Chunk(chunk) => {
             println!("[stub] rag chunk: {chunk:#?}");
