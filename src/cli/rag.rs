@@ -1,3 +1,4 @@
+mod chunk_md;
 mod fetch_web;
 mod struct_md;
 
@@ -46,25 +47,9 @@ pub struct RagStructArgs {
 
 #[derive(Debug, Args)]
 pub struct RagChunkArgs {
-    /// Input directory with structured Markdown
-    #[arg(long, default_value = "data/structured/md")]
-    pub input_dir: PathBuf,
-
-    /// Output JSON file with chunks
-    #[arg(long, default_value = "data/chunks/chunks.json")]
-    pub output_file: PathBuf,
-
-    /// Maximum chunk size in characters
-    #[arg(long, default_value_t = 1200)]
-    pub chunk_size: usize,
-
-    /// Chunk overlap in characters
-    #[arg(long, default_value_t = 200)]
-    pub chunk_overlap: usize,
-
-    /// Minimum chunk size
-    #[arg(long, default_value_t = 50)]
-    pub min_chars: usize,
+    /// Verbose chunker logs
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Args)]
@@ -128,7 +113,10 @@ pub fn run(args: RagArgs) {
             }
         }
         RagCommand::Chunk(chunk) => {
-            println!("[stub] rag chunk: {chunk:#?}");
+            if let Err(err) = chunk_md::run(chunk) {
+                eprintln!("[error] rag chunk failed: {err:#}");
+                std::process::exit(1);
+            }
         }
         RagCommand::Deploy(deploy) => {
             println!("[stub] rag deploy: {deploy:#?}");
