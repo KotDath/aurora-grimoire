@@ -1,4 +1,7 @@
+mod bundle;
 mod chunk_md;
+mod deploy;
+mod embed;
 mod fetch_web;
 mod struct_md;
 
@@ -24,8 +27,14 @@ pub enum RagCommand {
     /// Split Markdown files into JSON chunks
     Chunk(RagChunkArgs),
 
-    /// Write chunks to a vector store
+    /// Compute embeddings for chunks
+    Embed(RagEmbedArgs),
+
+    /// Write vectors to a vector store
     Deploy(RagDeployArgs),
+
+    /// Export/import portable chunk/vector bundles
+    Bundle(RagBundleArgs),
 
     /// Clear RAG artifacts/index
     Clear(RagClearArgs),
@@ -53,26 +62,134 @@ pub struct RagChunkArgs {
 }
 
 #[derive(Debug, Args)]
-pub struct RagDeployArgs {
-    /// Chunk source (JSON)
-    #[arg(long, default_value = "data/chunks/chunks.json")]
-    pub input_file: PathBuf,
+pub struct RagEmbedArgs {
+    /// Verbose embedding logs
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
 
-    /// Vector store provider name
-    #[arg(long, default_value = "local")]
-    pub provider: String,
+    /// Ollama base URL
+    #[arg(long, default_value = "http://127.0.0.1:11434")]
+    pub ollama_url: String,
+
+    /// Embedding model name
+    #[arg(long, default_value = "qwen3-embedding:0.6b")]
+    pub model: String,
+
+    /// Number of chunks per embedding batch
+    #[arg(long, default_value_t = 16)]
+    pub batch_size: usize,
+
+    /// Parallel embedding workers
+    #[arg(long, default_value_t = 2)]
+    pub workers: usize,
+
+    /// Chunk source directory
+    #[arg(long)]
+    pub input: Option<PathBuf>,
+
+    /// Output vectors directory
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Resume and skip chunks that already have vectors
+    #[arg(long, default_value_t = false)]
+    pub resume: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RagDeployArgs {
+    /// Verbose deploy logs
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
+
+    /// Qdrant base URL
+    #[arg(long, default_value = "http://127.0.0.1:6334")]
+    pub url: String,
+
+    /// Qdrant API key
+    #[arg(long)]
+    pub api_key: Option<String>,
 
     /// Collection/index in the vector store
-    #[arg(long, default_value = "aurora_docs")]
+    #[arg(long, default_value = "aurora_docs_qwen3_embedding_0_6b")]
     pub collection: String,
 
-    /// Reset collection before upload
-    #[arg(long, default_value_t = false)]
-    pub reset_collection: bool,
+    /// Input vectors directory or bundle file
+    #[arg(long)]
+    pub input: Option<PathBuf>,
 
-    /// Validate input without writing to the store
+    /// Number of points per upsert batch
+    #[arg(long, default_value_t = 256)]
+    pub batch_size: usize,
+
+    /// Recreate collection before upload
     #[arg(long, default_value_t = false)]
-    pub dry_run: bool,
+    pub recreate: bool,
+
+    /// Treat input as bundle and read vectors from it
+    #[arg(long, default_value_t = false)]
+    pub from_bundle: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RagBundleArgs {
+    #[command(subcommand)]
+    pub command: RagBundleCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RagBundleCommand {
+    /// Create bundle from chunk/vector artifacts
+    Create(RagBundleCreateArgs),
+    /// Print bundle manifest
+    Inspect(RagBundleInspectArgs),
+    /// Extract bundle contents
+    Extract(RagBundleExtractArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RagBundleCreateArgs {
+    /// Verbose bundle logs
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
+
+    /// Bundle type: chunks, vectors or dual
+    #[arg(long = "type", default_value = "dual")]
+    pub bundle_type: String,
+
+    /// Input chunks directory
+    #[arg(long)]
+    pub input_chunks: Option<PathBuf>,
+
+    /// Input vectors directory
+    #[arg(long)]
+    pub input_vectors: Option<PathBuf>,
+
+    /// Output bundle file (.tar.zst)
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct RagBundleInspectArgs {
+    /// Bundle file path
+    #[arg(long)]
+    pub file: PathBuf,
+}
+
+#[derive(Debug, Args)]
+pub struct RagBundleExtractArgs {
+    /// Verbose extract logs
+    #[arg(short, long, default_value_t = false)]
+    pub verbose: bool,
+
+    /// Bundle file path
+    #[arg(long)]
+    pub file: PathBuf,
+
+    /// Extraction root directory
+    #[arg(long)]
+    pub out: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -118,8 +235,23 @@ pub fn run(args: RagArgs) {
                 std::process::exit(1);
             }
         }
+        RagCommand::Embed(embed_args) => {
+            if let Err(err) = embed::run(embed_args) {
+                eprintln!("[error] rag embed failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
         RagCommand::Deploy(deploy) => {
-            println!("[stub] rag deploy: {deploy:#?}");
+            if let Err(err) = deploy::run(deploy) {
+                eprintln!("[error] rag deploy failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
+        RagCommand::Bundle(bundle_args) => {
+            if let Err(err) = bundle::run(bundle_args) {
+                eprintln!("[error] rag bundle failed: {err:#}");
+                std::process::exit(1);
+            }
         }
         RagCommand::Clear(clear) => {
             println!("[stub] rag clear: {clear:#?}");
