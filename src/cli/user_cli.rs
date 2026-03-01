@@ -52,6 +52,10 @@ pub struct SearchDocsArgs {
     #[arg(long, default_value_t = false)]
     pub with_content: bool,
 
+    /// Return compact LLM-friendly context segments (full cleaned content + sources)
+    #[arg(long, default_value_t = false)]
+    pub with_context: bool,
+
     /// Qdrant base URL
     #[arg(long)]
     pub qdrant_url: Option<String>,
@@ -170,6 +174,28 @@ struct SearchResponseOutput {
     bm25_latency_ms: Option<u128>,
     rerank_latency_ms: Option<u128>,
     results: Vec<SearchResultOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextSegmentOutput {
+    source_title: Option<String>,
+    source_url: Option<String>,
+    source_url_with_anchor: Option<String>,
+    section_anchor: Option<String>,
+    source_md: Option<String>,
+    version_bucket: Option<String>,
+    heading_path: Option<Vec<String>>,
+    content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchContextResponseOutput {
+    query: String,
+    doc_version: Option<String>,
+    knowledge_threshold: ConfidenceLevel,
+    no_knowledge: bool,
+    no_knowledge_message: Option<String>,
+    contexts: Vec<ContextSegmentOutput>,
 }
 
 #[derive(Debug, Clone)]
@@ -394,7 +420,7 @@ fn run_search_docs(args: SearchDocsArgs) -> Result<()> {
     let mut results = candidates
         .into_iter()
         .take(top_k)
-        .map(|candidate| map_output_result(candidate, args.with_content))
+        .map(|candidate| map_output_result(candidate, args.with_content || args.with_context))
         .collect::<Result<Vec<_>>>()?;
     let (answer_confidence, advisory) =
         evaluate_answer_quality(&query, doc_version.as_deref(), &results);
@@ -447,6 +473,51 @@ fn run_search_docs(args: SearchDocsArgs) -> Result<()> {
         rerank_latency_ms,
         results,
     };
+
+    if args.with_context {
+        let context_response = build_context_response(&response);
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&context_response)
+                    .context("failed to serialize context JSON output")?
+            );
+            return Ok(());
+        }
+
+        if context_response.contexts.is_empty() {
+            if let Some(message) = &context_response.no_knowledge_message {
+                println!("{}", message);
+            } else {
+                println!("No context found");
+            }
+            return Ok(());
+        }
+
+        println!(
+            "{} context segment(s) for query=\"{}\"",
+            context_response.contexts.len(),
+            context_response.query
+        );
+        for (idx, segment) in context_response.contexts.iter().enumerate() {
+            println!(
+                "{}. {}",
+                idx + 1,
+                segment.source_title.as_deref().unwrap_or("-")
+            );
+            if let Some(url) = &segment.source_url_with_anchor {
+                if !url.is_empty() {
+                    println!("   source: {}", url);
+                }
+            } else if let Some(url) = &segment.source_url {
+                if !url.is_empty() {
+                    println!("   source: {}", url);
+                }
+            }
+            println!("   content: {}", segment.content.replace('\n', " "));
+        }
+        return Ok(());
+    }
 
     if args.json {
         println!(
@@ -758,17 +829,18 @@ fn map_output_result(candidate: SearchCandidate, with_content: bool) -> Result<S
         .payload
         .as_object()
         .ok_or_else(|| anyhow!("qdrant point payload is not a JSON object"))?;
-    let content = payload
+    let raw_content = payload
         .get("content")
         .and_then(Value::as_str)
         .unwrap_or_default();
+    let content = normalize_content_for_context(raw_content);
 
-    let content_value = if with_content {
-        Some(content.to_string())
-    } else if content.is_empty() {
+    let content_value = if content.is_empty() {
         None
+    } else if with_content {
+        Some(content)
     } else {
-        Some(shorten(content, 280))
+        Some(shorten(&content, 280))
     };
 
     let heading_path = payload
@@ -818,6 +890,38 @@ fn map_output_result(candidate: SearchCandidate, with_content: bool) -> Result<S
         heading_path,
         content: content_value,
     })
+}
+
+fn build_context_response(response: &SearchResponseOutput) -> SearchContextResponseOutput {
+    let contexts = response
+        .results
+        .iter()
+        .filter_map(|result| {
+            let content = result.content.as_deref().unwrap_or("").trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(ContextSegmentOutput {
+                source_title: result.source_title.clone(),
+                source_url: result.source_url.clone(),
+                source_url_with_anchor: result.source_url_with_anchor.clone(),
+                section_anchor: result.section_anchor.clone(),
+                source_md: result.source_md.clone(),
+                version_bucket: result.version_bucket.clone(),
+                heading_path: result.heading_path.clone(),
+                content: content.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    SearchContextResponseOutput {
+        query: response.query.clone(),
+        doc_version: response.doc_version.clone(),
+        knowledge_threshold: response.knowledge_threshold,
+        no_knowledge: response.no_knowledge,
+        no_knowledge_message: response.no_knowledge_message.clone(),
+        contexts,
+    }
 }
 
 fn rerank_candidates(
@@ -1757,6 +1861,67 @@ fn shorten(text: &str, max_chars: usize) -> String {
     format!("{head}...")
 }
 
+fn normalize_content_for_context(text: &str) -> String {
+    // Keep full semantics, but remove markdown noise and extra spacing for LLM context.
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut lines = text.lines().peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            out_lines.push(String::new());
+            continue;
+        }
+
+        // Convert markdown definition list:
+        // `term`
+        // : description
+        if let Some(next_line) = lines.peek() {
+            let next_trimmed = next_line.trim_start();
+            if next_trimmed.starts_with(':') {
+                let term = strip_wrapping_backticks(trimmed);
+                let definition = next_trimmed.trim_start_matches(':').trim();
+                let merged = if definition.is_empty() {
+                    term.to_string()
+                } else {
+                    format!("{term} — {definition}")
+                };
+                out_lines.push(merged);
+                let _ = lines.next();
+                continue;
+            }
+        }
+
+        out_lines.push(trimmed.to_string());
+    }
+
+    // Collapse repeated blank lines.
+    let mut collapsed: Vec<String> = Vec::with_capacity(out_lines.len());
+    let mut prev_blank = false;
+    for line in out_lines {
+        if line.is_empty() {
+            if !prev_blank {
+                collapsed.push(String::new());
+                prev_blank = true;
+            }
+        } else {
+            collapsed.push(line);
+            prev_blank = false;
+        }
+    }
+
+    collapsed.join("\n").trim().to_string()
+}
+
+fn strip_wrapping_backticks(value: &str) -> &str {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 && trimmed.starts_with('`') && trimmed.ends_with('`') {
+        &trimmed[1..trimmed.len() - 1]
+    } else {
+        trimmed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1778,6 +1943,16 @@ mod tests {
                 "version_bucket": "5.2.0"
             }),
         }
+    }
+
+    #[test]
+    fn normalize_content_for_context_compacts_definition_list() {
+        let src = "`application_id`\n: Unique app id\n\n`project_id`\n: Project id\n";
+        let got = normalize_content_for_context(src);
+        assert_eq!(
+            got,
+            "application_id — Unique app id\n\nproject_id — Project id"
+        );
     }
 
     #[test]

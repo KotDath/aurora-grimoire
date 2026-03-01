@@ -122,6 +122,10 @@ struct SearchDocsToolInput {
     rerank: Option<bool>,
     #[schemars(description = "Include full content in each result")]
     with_content: Option<bool>,
+    #[schemars(
+        description = "Return compact LLM context segments (full cleaned content + sources)"
+    )]
+    with_context: Option<bool>,
 }
 
 #[tool_router]
@@ -174,6 +178,9 @@ impl SearchDocsMcpServer {
         }
         if input.with_content.unwrap_or(false) {
             cmd.arg("--with-content");
+        }
+        if input.with_context.unwrap_or(false) {
+            cmd.arg("--with-context");
         }
         match input.rerank {
             Some(true) => {
