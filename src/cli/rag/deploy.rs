@@ -333,7 +333,7 @@ fn upsert_points(
     );
     let response = send_json_request(
         client,
-        Method::POST,
+        Method::PUT,
         &url,
         api_key,
         Some(&json!({ "points": points })),
