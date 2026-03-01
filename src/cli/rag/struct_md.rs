@@ -1,4 +1,5 @@
 use super::RagStructArgs;
+use crate::config::AppConfig;
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use ego_tree::NodeRef;
@@ -56,11 +57,10 @@ struct OutputTarget {
 
 pub fn run(args: RagStructArgs) -> Result<()> {
     let verbose = args.verbose;
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory for struct"))?;
-
-    let input_root = home_dir.join(".aurora-grimoire").join(HTML_ROOT_DIRNAME);
-    let output_root = home_dir.join(".aurora-grimoire").join(MD_ROOT_DIRNAME);
+    let cfg = AppConfig::load()?;
+    let data_root = cfg.data_root()?;
+    let input_root = data_root.join(HTML_ROOT_DIRNAME);
+    let output_root = data_root.join(MD_ROOT_DIRNAME);
     if !input_root.exists() {
         return Err(anyhow!(
             "input directory does not exist: {}",

@@ -1,4 +1,5 @@
 use super::RagFetchWebArgs;
+use crate::config::AppConfig;
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use reqwest::{
@@ -507,11 +508,12 @@ fn build_http_client() -> Result<Client> {
 }
 
 fn resolve_output_root() -> Result<PathBuf> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| anyhow!("failed to resolve home directory for html_data storage"))?;
-    Ok(build_output_root_from_home(&home))
+    let cfg = AppConfig::load()?;
+    let data_root = cfg.data_root()?;
+    Ok(data_root.join("html_data"))
 }
 
+#[cfg(test)]
 fn build_output_root_from_home(home_dir: &Path) -> PathBuf {
     home_dir.join(".aurora-grimoire").join("html_data")
 }

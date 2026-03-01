@@ -1,11 +1,20 @@
+use crate::cli::retrieval_bm25;
+use crate::config::{
+    AppConfig, DEFAULT_COLLECTION, DEFAULT_EMBED_MODEL, DEFAULT_OLLAMA_URL, DEFAULT_QDRANT_URL,
+    DEFAULT_RERANK_MODEL, DEFAULT_RERANK_URL, DEFAULT_SEARCH_BM25_TOP_N,
+    DEFAULT_SEARCH_BM25_WEIGHT, DEFAULT_SEARCH_DENSE_WEIGHT, DEFAULT_SEARCH_RERANK_ENABLED,
+    DEFAULT_SEARCH_RERANK_FAIL_OPEN, DEFAULT_SEARCH_RERANK_TIMEOUT_MS, DEFAULT_SEARCH_RRF_K,
+    DEFAULT_SEARCH_SCORE_THRESHOLD, DEFAULT_SEARCH_TOP_K, DEFAULT_SEARCH_TOP_N,
+};
 use anyhow::{Context, Result, anyhow};
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use reqwest::{Method, StatusCode, blocking::Client};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     env,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -28,12 +37,12 @@ pub struct SearchDocsArgs {
     pub query: String,
 
     /// Number of relevant chunks to return
-    #[arg(long, default_value_t = 5)]
-    pub top_k: usize,
+    #[arg(long)]
+    pub top_k: Option<usize>,
 
     /// Relevance threshold [0..1]
-    #[arg(long, default_value_t = 0.0)]
-    pub score_threshold: f32,
+    #[arg(long)]
+    pub score_threshold: Option<f32>,
 
     /// Return JSON instead of text
     #[arg(long, default_value_t = false)]
@@ -44,24 +53,24 @@ pub struct SearchDocsArgs {
     pub with_content: bool,
 
     /// Qdrant base URL
-    #[arg(long, default_value = "http://127.0.0.1:6333")]
-    pub qdrant_url: String,
+    #[arg(long)]
+    pub qdrant_url: Option<String>,
 
     /// Qdrant API key (or use QDRANT_API_KEY env)
     #[arg(long)]
     pub api_key: Option<String>,
 
     /// Qdrant collection name
-    #[arg(long, default_value = "aurora_docs_qwen3_embedding_0_6b")]
-    pub collection: String,
+    #[arg(long)]
+    pub collection: Option<String>,
 
     /// Ollama base URL
-    #[arg(long, default_value = "http://127.0.0.1:11434")]
-    pub ollama_url: String,
+    #[arg(long)]
+    pub ollama_url: Option<String>,
 
     /// Embedding model name
-    #[arg(long, default_value = "qwen3-embedding:0.6b")]
-    pub model: String,
+    #[arg(long)]
+    pub model: Option<String>,
 
     /// Filter results by documentation version bucket (e.g. 5.2.0, default)
     #[arg(long = "doc-version")]
@@ -75,29 +84,29 @@ pub struct SearchDocsArgs {
     #[arg(long, default_value_t = false)]
     pub no_rerank: bool,
 
-    /// Number of candidates retrieved from Qdrant before rerank
-    #[arg(long, default_value_t = 30)]
-    pub top_n: usize,
+    /// Retrieval mode
+    #[arg(long, value_enum)]
+    pub retrieval_mode: Option<RetrievalMode>,
 
-    /// Local rerank service base URL
-    #[arg(long, default_value = "http://127.0.0.1:8081")]
-    pub rerank_url: String,
+    /// Minimum confidence required to return sources
+    #[arg(long, value_enum)]
+    pub knowledge_threshold: Option<ConfidenceLevel>,
+}
 
-    /// Rerank model id
-    #[arg(long, default_value = "BAAI/bge-reranker-v2-m3")]
-    pub rerank_model: String,
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RetrievalMode {
+    Hybrid,
+    Dense,
+    Bm25,
+}
 
-    /// Rerank API key (or use RERANK_API_KEY env)
-    #[arg(long)]
-    pub rerank_api_key: Option<String>,
-
-    /// Rerank request timeout in milliseconds
-    #[arg(long, default_value_t = 30000)]
-    pub rerank_timeout_ms: u64,
-
-    /// If rerank fails, fallback to retrieval order instead of hard-failing
-    #[arg(long, default_value_t = true)]
-    pub rerank_fail_open: bool,
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ConfidenceLevel {
+    Low,
+    Medium,
+    High,
 }
 
 pub fn run(args: CliArgs) {
@@ -118,6 +127,9 @@ struct SearchResultOutput {
     retrieval_score: f32,
     rerank_score: Option<f32>,
     retrieval_rank: usize,
+    dense_rank: Option<usize>,
+    bm25_rank: Option<usize>,
+    rrf_score: Option<f32>,
     rerank_rank: Option<usize>,
     version_bucket: Option<String>,
     source_title: Option<String>,
@@ -132,15 +144,30 @@ struct SearchResultOutput {
 #[derive(Debug, Serialize)]
 struct SearchResponseOutput {
     query: String,
+    retrieval_query: String,
     collection: String,
+    retrieval_mode: RetrievalMode,
+    fusion_method: Option<String>,
     top_k: usize,
     top_n: usize,
+    bm25_top_n: usize,
+    rrf_k: usize,
+    dense_weight: f32,
+    bm25_weight: f32,
     score_threshold: f32,
     doc_version: Option<String>,
+    bm25_applied: bool,
+    answer_confidence: String,
+    advisory: Option<String>,
+    knowledge_threshold: ConfidenceLevel,
+    no_knowledge: bool,
+    no_knowledge_message: Option<String>,
     rerank_enabled: bool,
     rerank_applied: bool,
     rerank_model: Option<String>,
     retrieval_latency_ms: u128,
+    dense_latency_ms: Option<u128>,
+    bm25_latency_ms: Option<u128>,
     rerank_latency_ms: Option<u128>,
     results: Vec<SearchResultOutput>,
 }
@@ -149,6 +176,9 @@ struct SearchResponseOutput {
 struct SearchCandidate {
     id: String,
     retrieval_score: f32,
+    dense_rank: Option<usize>,
+    bm25_rank: Option<usize>,
+    rrf_score: Option<f32>,
     rerank_score: Option<f32>,
     retrieval_rank: usize,
     rerank_rank: Option<usize>,
@@ -161,50 +191,167 @@ struct RerankScore {
     relevance_score: f32,
 }
 
+#[derive(Debug, Clone)]
+struct SearchRuntimeConfig {
+    top_k: usize,
+    score_threshold: f32,
+    qdrant_url: String,
+    collection: String,
+    ollama_url: String,
+    model: String,
+    retrieval_mode: RetrievalMode,
+    knowledge_threshold: ConfidenceLevel,
+    top_n: usize,
+    bm25_top_n: usize,
+    rrf_k: usize,
+    dense_weight: f32,
+    bm25_weight: f32,
+    rerank_url: String,
+    rerank_model: String,
+    rerank_timeout_ms: u64,
+    rerank_fail_open: bool,
+    rerank_default_enabled: bool,
+}
+
 fn run_search_docs(args: SearchDocsArgs) -> Result<()> {
-    let qdrant_api_key = args.api_key.or_else(|| env::var("QDRANT_API_KEY").ok());
-    let rerank_api_key = args
-        .rerank_api_key
-        .or_else(|| env::var("RERANK_API_KEY").ok());
+    let app_cfg = AppConfig::load()?;
+    let runtime = resolve_runtime_config(&args, &app_cfg);
+    let query = args.query.clone();
+    let doc_version = args.doc_version.clone();
+    let qdrant_api_key = args
+        .api_key
+        .clone()
+        .or_else(|| env::var("QDRANT_API_KEY").ok());
+    let rerank_api_key = env::var("RERANK_API_KEY").ok();
     let client = Client::builder()
         .timeout(Duration::from_secs(60))
         .build()
         .context("failed to build HTTP client")?;
     let rerank_client = Client::builder()
-        .timeout(Duration::from_millis(args.rerank_timeout_ms.max(1)))
+        .timeout(Duration::from_millis(runtime.rerank_timeout_ms.max(1)))
         .build()
         .context("failed to build rerank HTTP client")?;
 
-    let top_k = args.top_k.max(1);
-    let top_n = normalize_top_n(top_k, args.top_n);
-    let rerank_enabled = resolve_rerank_enabled(args.rerank, args.no_rerank);
-
-    let query_embedding = embed_query(&client, &args.ollama_url, &args.model, &args.query)?;
+    let top_k = runtime.top_k.max(1);
+    let top_n = normalize_top_n(top_k, runtime.top_n);
+    let bm25_top_n = normalize_top_n(top_n, runtime.bm25_top_n);
+    let dense_weight = sanitize_channel_weight(runtime.dense_weight);
+    let bm25_weight = sanitize_channel_weight(runtime.bm25_weight);
+    let rerank_enabled =
+        resolve_rerank_enabled(args.rerank, args.no_rerank, runtime.rerank_default_enabled);
+    let retrieval_query = build_retrieval_query(&query);
     let retrieval_start = Instant::now();
-    let qdrant_points = search_qdrant(
-        &client,
-        &args.qdrant_url,
-        qdrant_api_key.as_deref(),
-        &args.collection,
-        &query_embedding,
-        if rerank_enabled { top_n } else { top_k },
-        args.score_threshold,
-        args.doc_version.as_deref(),
-    )?;
-    let retrieval_latency_ms = retrieval_start.elapsed().as_millis();
+    let mut dense_latency_ms = None;
+    let mut bm25_latency_ms = None;
+    let mut dense_error: Option<anyhow::Error> = None;
+    let mut bm25_error: Option<anyhow::Error> = None;
+    let mut dense_candidates: Vec<SearchCandidate> = Vec::new();
+    let mut bm25_candidates: Vec<SearchCandidate> = Vec::new();
 
-    let mut candidates = qdrant_points
-        .into_iter()
-        .enumerate()
-        .map(|(idx, point)| SearchCandidate {
-            id: point.id,
-            retrieval_score: point.score,
-            rerank_score: None,
-            retrieval_rank: idx + 1,
-            rerank_rank: None,
-            payload: point.payload,
-        })
-        .collect::<Vec<_>>();
+    if runtime.retrieval_mode != RetrievalMode::Bm25 {
+        let dense_start = Instant::now();
+        match retrieve_dense_candidates(
+            &client,
+            &runtime,
+            qdrant_api_key.as_deref(),
+            top_n,
+            doc_version.as_deref(),
+            &retrieval_query,
+        ) {
+            Ok(candidates) => dense_candidates = candidates,
+            Err(err) => dense_error = Some(err),
+        }
+        dense_latency_ms = Some(dense_start.elapsed().as_millis());
+    }
+
+    if runtime.retrieval_mode != RetrievalMode::Dense {
+        let bm25_start = Instant::now();
+        match retrieve_bm25_candidates(
+            &app_cfg,
+            &args,
+            bm25_top_n,
+            doc_version.as_deref(),
+            &retrieval_query,
+        ) {
+            Ok(candidates) => bm25_candidates = candidates,
+            Err(err) => bm25_error = Some(err),
+        }
+        bm25_latency_ms = Some(bm25_start.elapsed().as_millis());
+    }
+
+    let mut bm25_applied = false;
+    let mut candidates = match runtime.retrieval_mode {
+        RetrievalMode::Dense => {
+            if let Some(err) = dense_error {
+                return Err(err.context("dense retrieval failed"));
+            }
+            dense_candidates
+        }
+        RetrievalMode::Bm25 => {
+            if let Some(err) = bm25_error {
+                return Err(err.context("bm25 retrieval failed"));
+            }
+            bm25_applied = true;
+            bm25_candidates
+        }
+        RetrievalMode::Hybrid => {
+            let dense_available = !dense_candidates.is_empty();
+            let bm25_available = !bm25_candidates.is_empty();
+
+            match (dense_available, bm25_available) {
+                (true, true) => {
+                    bm25_applied = true;
+                    fuse_rrf(
+                        dense_candidates,
+                        bm25_candidates,
+                        runtime.rrf_k,
+                        dense_weight,
+                        bm25_weight,
+                        top_n,
+                    )
+                }
+                (true, false) => {
+                    if let Some(err) = bm25_error {
+                        eprintln!(
+                            "[warn] BM25 unavailable, fallback to dense retrieval: {}",
+                            err
+                        );
+                    }
+                    dense_candidates
+                }
+                (false, true) => {
+                    if let Some(err) = dense_error {
+                        eprintln!(
+                            "[warn] dense retrieval unavailable, fallback to BM25: {}",
+                            err
+                        );
+                    }
+                    bm25_applied = true;
+                    bm25_candidates
+                }
+                (false, false) => {
+                    let mut reasons = Vec::new();
+                    if let Some(err) = dense_error {
+                        reasons.push(format!("dense: {err:#}"));
+                    }
+                    if let Some(err) = bm25_error {
+                        reasons.push(format!("bm25: {err:#}"));
+                    }
+                    let details = if reasons.is_empty() {
+                        "both channels returned no candidates".to_string()
+                    } else {
+                        reasons.join("; ")
+                    };
+                    return Err(anyhow!("hybrid retrieval failed: {details}"));
+                }
+            }
+        }
+    };
+
+    for (idx, candidate) in candidates.iter_mut().enumerate() {
+        candidate.retrieval_rank = idx + 1;
+    }
+    let retrieval_latency_ms = retrieval_start.elapsed().as_millis();
 
     let mut rerank_applied = false;
     let mut rerank_latency_ms = None;
@@ -214,10 +361,10 @@ fn run_search_docs(args: SearchDocsArgs) -> Result<()> {
         let start = Instant::now();
         let rerank_result = rerank_candidates(
             &rerank_client,
-            &args.rerank_url,
+            &runtime.rerank_url,
             rerank_api_key.as_deref(),
-            &args.rerank_model,
-            &args.query,
+            &runtime.rerank_model,
+            &query,
             candidates,
             top_n,
         );
@@ -233,7 +380,7 @@ fn run_search_docs(args: SearchDocsArgs) -> Result<()> {
                 candidates = retrieval_candidates;
             }
             Err(err) => {
-                if args.rerank_fail_open {
+                if runtime.rerank_fail_open {
                     // Keep retrieval order on rerank failure.
                     let _ = err;
                     candidates = retrieval_candidates;
@@ -244,27 +391,59 @@ fn run_search_docs(args: SearchDocsArgs) -> Result<()> {
         }
     }
 
-    let results = candidates
+    let mut results = candidates
         .into_iter()
         .take(top_k)
         .map(|candidate| map_output_result(candidate, args.with_content))
         .collect::<Result<Vec<_>>>()?;
+    let (answer_confidence, advisory) =
+        evaluate_answer_quality(&query, doc_version.as_deref(), &results);
+    let confidence_level = parse_confidence_level(&answer_confidence);
+    let no_knowledge =
+        confidence_rank(confidence_level) < confidence_rank(runtime.knowledge_threshold);
+    let no_knowledge_message = if no_knowledge {
+        Some(build_no_knowledge_message(doc_version.as_deref()))
+    } else {
+        None
+    };
+    if no_knowledge {
+        results.clear();
+    }
 
     let response = SearchResponseOutput {
-        query: args.query,
-        collection: args.collection,
+        query,
+        retrieval_query,
+        collection: runtime.collection.clone(),
+        retrieval_mode: runtime.retrieval_mode,
+        fusion_method: if runtime.retrieval_mode == RetrievalMode::Hybrid {
+            Some("rrf".to_string())
+        } else {
+            None
+        },
         top_k,
         top_n,
-        score_threshold: args.score_threshold,
-        doc_version: args.doc_version,
+        bm25_top_n,
+        rrf_k: runtime.rrf_k,
+        dense_weight,
+        bm25_weight,
+        score_threshold: runtime.score_threshold,
+        doc_version,
+        bm25_applied,
+        answer_confidence,
+        advisory,
+        knowledge_threshold: runtime.knowledge_threshold,
+        no_knowledge,
+        no_knowledge_message,
         rerank_enabled,
         rerank_applied,
         rerank_model: if rerank_enabled {
-            Some(args.rerank_model)
+            Some(runtime.rerank_model.clone())
         } else {
             None
         },
         retrieval_latency_ms,
+        dense_latency_ms,
+        bm25_latency_ms,
         rerank_latency_ms,
         results,
     };
@@ -278,32 +457,57 @@ fn run_search_docs(args: SearchDocsArgs) -> Result<()> {
     }
 
     if response.results.is_empty() {
-        println!("No results found");
+        if let Some(message) = &response.no_knowledge_message {
+            println!("{}", message);
+        } else {
+            println!("No results found");
+        }
         return Ok(());
     }
 
     println!(
-        "{} results from {} (retrieval={}ms, rerank={} applied={})",
+        "{} results from {} (mode={}, retrieval={}ms, dense={}, bm25={}, rerank={} applied={}, confidence={})",
         response.results.len(),
         response.collection,
+        retrieval_mode_name(response.retrieval_mode),
         response.retrieval_latency_ms,
+        response
+            .dense_latency_ms
+            .map(|v| format!("{v}ms"))
+            .unwrap_or_else(|| "-".to_string()),
+        response
+            .bm25_latency_ms
+            .map(|v| format!("{v}ms"))
+            .unwrap_or_else(|| "-".to_string()),
         response
             .rerank_latency_ms
             .map(|v| format!("{v}ms"))
             .unwrap_or_else(|| "-".to_string()),
-        response.rerank_applied
+        response.rerank_applied,
+        response.answer_confidence
     );
+    if let Some(advisory) = &response.advisory {
+        println!("note: {}", advisory);
+    }
     for (idx, result) in response.results.iter().enumerate() {
         let rerank_score = result
             .rerank_score
             .map(|v| format!("{v:.4}"))
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "{}. score={:.4} retrieval={:.4} rerank={} version={} title={}",
+            "{}. score={:.4} retrieval={:.4} rerank={} dense_rank={} bm25_rank={} version={} title={}",
             idx + 1,
             result.score,
             result.retrieval_score,
             rerank_score,
+            result
+                .dense_rank
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            result
+                .bm25_rank
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             result
                 .version_bucket
                 .as_deref()
@@ -329,6 +533,217 @@ fn run_search_docs(args: SearchDocsArgs) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_runtime_config(args: &SearchDocsArgs, app_cfg: &AppConfig) -> SearchRuntimeConfig {
+    let top_k = args
+        .top_k
+        .or(app_cfg.search.top_k)
+        .unwrap_or(DEFAULT_SEARCH_TOP_K)
+        .max(1);
+    let score_threshold = args
+        .score_threshold
+        .or(app_cfg.search.score_threshold)
+        .unwrap_or(DEFAULT_SEARCH_SCORE_THRESHOLD);
+    let qdrant_url = args
+        .qdrant_url
+        .clone()
+        .or_else(|| app_cfg.search.qdrant_url.clone())
+        .or_else(|| app_cfg.deploy.qdrant_url.clone())
+        .unwrap_or_else(|| DEFAULT_QDRANT_URL.to_string());
+    let collection = args
+        .collection
+        .clone()
+        .or_else(|| app_cfg.search.collection.clone())
+        .or_else(|| app_cfg.deploy.collection.clone())
+        .unwrap_or_else(|| DEFAULT_COLLECTION.to_string());
+    let ollama_url = args
+        .ollama_url
+        .clone()
+        .or_else(|| app_cfg.search.ollama_url.clone())
+        .or_else(|| app_cfg.embed.ollama_url.clone())
+        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+    let model = args
+        .model
+        .clone()
+        .or_else(|| app_cfg.search.model.clone())
+        .or_else(|| app_cfg.embed.model.clone())
+        .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string());
+    let retrieval_mode = args
+        .retrieval_mode
+        .or_else(|| parse_retrieval_mode(app_cfg.search.retrieval_mode.as_deref()))
+        .unwrap_or(RetrievalMode::Hybrid);
+    let knowledge_threshold = args
+        .knowledge_threshold
+        .or_else(|| parse_knowledge_threshold(app_cfg.search.knowledge_threshold.as_deref()))
+        .unwrap_or(ConfidenceLevel::Medium);
+    let top_n = app_cfg
+        .search
+        .top_n
+        .unwrap_or(DEFAULT_SEARCH_TOP_N)
+        .max(top_k);
+    let bm25_top_n = app_cfg
+        .search
+        .bm25_top_n
+        .unwrap_or(DEFAULT_SEARCH_BM25_TOP_N)
+        .max(top_n);
+    let rrf_k = app_cfg.search.rrf_k.unwrap_or(DEFAULT_SEARCH_RRF_K).max(1);
+    let dense_weight = app_cfg
+        .search
+        .dense_weight
+        .unwrap_or(DEFAULT_SEARCH_DENSE_WEIGHT);
+    let bm25_weight = app_cfg
+        .search
+        .bm25_weight
+        .unwrap_or(DEFAULT_SEARCH_BM25_WEIGHT);
+    let rerank_url = app_cfg
+        .search
+        .rerank_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_RERANK_URL.to_string());
+    let rerank_model = app_cfg
+        .search
+        .rerank_model
+        .clone()
+        .unwrap_or_else(|| DEFAULT_RERANK_MODEL.to_string());
+    let rerank_timeout_ms = app_cfg
+        .search
+        .rerank_timeout_ms
+        .unwrap_or(DEFAULT_SEARCH_RERANK_TIMEOUT_MS)
+        .max(1);
+    let rerank_fail_open = app_cfg
+        .search
+        .rerank_fail_open
+        .unwrap_or(DEFAULT_SEARCH_RERANK_FAIL_OPEN);
+    let rerank_default_enabled = app_cfg
+        .search
+        .rerank_enabled
+        .unwrap_or(DEFAULT_SEARCH_RERANK_ENABLED);
+
+    SearchRuntimeConfig {
+        top_k,
+        score_threshold,
+        qdrant_url,
+        collection,
+        ollama_url,
+        model,
+        retrieval_mode,
+        knowledge_threshold,
+        top_n,
+        bm25_top_n,
+        rrf_k,
+        dense_weight,
+        bm25_weight,
+        rerank_url,
+        rerank_model,
+        rerank_timeout_ms,
+        rerank_fail_open,
+        rerank_default_enabled,
+    }
+}
+
+fn parse_retrieval_mode(value: Option<&str>) -> Option<RetrievalMode> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "hybrid" => Some(RetrievalMode::Hybrid),
+        "dense" => Some(RetrievalMode::Dense),
+        "bm25" => Some(RetrievalMode::Bm25),
+        _ => None,
+    }
+}
+
+fn parse_knowledge_threshold(value: Option<&str>) -> Option<ConfidenceLevel> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(ConfidenceLevel::Low),
+        "medium" => Some(ConfidenceLevel::Medium),
+        "high" => Some(ConfidenceLevel::High),
+        _ => None,
+    }
+}
+
+fn retrieve_dense_candidates(
+    client: &Client,
+    runtime: &SearchRuntimeConfig,
+    qdrant_api_key: Option<&str>,
+    top_n: usize,
+    doc_version: Option<&str>,
+    retrieval_query: &str,
+) -> Result<Vec<SearchCandidate>> {
+    let query_embedding =
+        embed_query(client, &runtime.ollama_url, &runtime.model, retrieval_query)?;
+    let qdrant_points = search_qdrant(
+        client,
+        &runtime.qdrant_url,
+        qdrant_api_key,
+        &runtime.collection,
+        &query_embedding,
+        top_n,
+        runtime.score_threshold,
+        doc_version,
+    )?;
+
+    Ok(qdrant_points
+        .into_iter()
+        .enumerate()
+        .map(|(idx, point)| SearchCandidate {
+            id: point.id,
+            retrieval_score: point.score,
+            dense_rank: Some(idx + 1),
+            bm25_rank: None,
+            rrf_score: None,
+            rerank_score: None,
+            retrieval_rank: idx + 1,
+            rerank_rank: None,
+            payload: point.payload,
+        })
+        .collect::<Vec<_>>())
+}
+
+fn retrieve_bm25_candidates(
+    app_cfg: &AppConfig,
+    args: &SearchDocsArgs,
+    top_n: usize,
+    doc_version: Option<&str>,
+    retrieval_query: &str,
+) -> Result<Vec<SearchCandidate>> {
+    let chunks_root = resolve_chunks_root(app_cfg)?;
+    let bm25_root = resolve_bm25_root(app_cfg)?;
+    let hits = retrieval_bm25::search_chunks(
+        retrieval_query,
+        &chunks_root,
+        &bm25_root,
+        doc_version,
+        top_n,
+    )?;
+    let mut candidates = hits
+        .into_iter()
+        .map(|hit| SearchCandidate {
+            id: hit.id,
+            retrieval_score: hit.score,
+            dense_rank: None,
+            bm25_rank: Some(hit.rank),
+            rrf_score: None,
+            rerank_score: None,
+            retrieval_rank: hit.rank,
+            rerank_rank: None,
+            payload: hit.payload,
+        })
+        .collect::<Vec<_>>();
+    postprocess_bm25_candidates(&mut candidates, &args.query);
+    Ok(candidates)
+}
+
+fn resolve_chunks_root(app_cfg: &AppConfig) -> Result<PathBuf> {
+    if let Some(path) = &app_cfg.search.chunks_dir {
+        return Ok(path.clone());
+    }
+    app_cfg.chunks_root()
+}
+
+fn resolve_bm25_root(app_cfg: &AppConfig) -> Result<PathBuf> {
+    if let Some(path) = &app_cfg.search.bm25_data_dir {
+        return Ok(path.clone());
+    }
+    app_cfg.bm25_root()
 }
 
 #[derive(Debug)]
@@ -372,6 +787,9 @@ fn map_output_result(candidate: SearchCandidate, with_content: bool) -> Result<S
         retrieval_score: candidate.retrieval_score,
         rerank_score: candidate.rerank_score,
         retrieval_rank: candidate.retrieval_rank,
+        dense_rank: candidate.dense_rank,
+        bm25_rank: candidate.bm25_rank,
+        rrf_score: candidate.rrf_score,
         rerank_rank: candidate.rerank_rank,
         version_bucket: payload
             .get("version_bucket")
@@ -605,12 +1023,480 @@ fn apply_rerank_order(
     ordered
 }
 
-fn resolve_rerank_enabled(rerank: bool, no_rerank: bool) -> bool {
-    rerank && !no_rerank
+fn resolve_rerank_enabled(rerank: bool, no_rerank: bool, default_enabled: bool) -> bool {
+    if no_rerank {
+        return false;
+    }
+    if rerank {
+        return true;
+    }
+    default_enabled
 }
 
 fn normalize_top_n(top_k: usize, top_n: usize) -> usize {
     top_n.max(top_k).max(1)
+}
+
+fn sanitize_channel_weight(value: f32) -> f32 {
+    if !value.is_finite() || value <= 0.0 {
+        return 1.0;
+    }
+    value
+}
+
+fn build_retrieval_query(raw: &str) -> String {
+    let mut tokens = Vec::new();
+    let lower = raw.to_lowercase();
+    if !raw.trim().is_empty() {
+        tokens.push(raw.trim().to_string());
+    }
+
+    let expansions = [
+        ("рпм", "rpm"),
+        ("rpm", "рпм"),
+        ("эмулятор", "emulator"),
+        ("emulator", "эмулятор"),
+        ("скриншот", "screenshot"),
+        ("screenshot", "скриншот"),
+        ("видео", "video"),
+        ("video", "видео"),
+        ("подпис", "sign signing signature"),
+        ("sign", "подписание подпись"),
+        ("установ", "install deploy"),
+        ("install", "установка установить"),
+        ("запуск", "run launch"),
+        ("запустить", "run launch"),
+        ("launch", "запуск"),
+        ("собрат", "build"),
+        ("build", "сборка собрать"),
+        ("терминал", "cli shell"),
+        ("командн", "cli shell"),
+        ("mb2", "mb2 build"),
+    ];
+    for (needle, addition) in expansions {
+        if lower.contains(needle) {
+            tokens.push(addition.to_string());
+        }
+    }
+
+    let mut seen = HashSet::new();
+    let mut uniq = Vec::new();
+    for token in tokens {
+        let t = token.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if seen.insert(t.to_string()) {
+            uniq.push(t.to_string());
+        }
+    }
+    uniq.join(" ")
+}
+
+fn retrieval_mode_name(mode: RetrievalMode) -> &'static str {
+    match mode {
+        RetrievalMode::Hybrid => "hybrid",
+        RetrievalMode::Dense => "dense",
+        RetrievalMode::Bm25 => "bm25",
+    }
+}
+
+fn fuse_rrf(
+    dense: Vec<SearchCandidate>,
+    bm25: Vec<SearchCandidate>,
+    rrf_k: usize,
+    dense_weight: f32,
+    bm25_weight: f32,
+    limit: usize,
+) -> Vec<SearchCandidate> {
+    #[derive(Debug)]
+    struct FusionEntry {
+        payload: Value,
+        dense_rank: Option<usize>,
+        bm25_rank: Option<usize>,
+        score: f32,
+    }
+
+    let mut merged: HashMap<String, FusionEntry> = HashMap::new();
+    let k = rrf_k.max(1) as f32;
+    let dense_w = sanitize_channel_weight(dense_weight);
+    let bm25_w = sanitize_channel_weight(bm25_weight);
+
+    for candidate in dense {
+        let rank = candidate
+            .dense_rank
+            .unwrap_or(candidate.retrieval_rank)
+            .max(1);
+        let entry = merged.entry(candidate.id).or_insert_with(|| FusionEntry {
+            payload: candidate.payload,
+            dense_rank: None,
+            bm25_rank: None,
+            score: 0.0,
+        });
+        entry.dense_rank = Some(rank);
+        entry.score += dense_w * (1.0 / (k + rank as f32));
+    }
+
+    for candidate in bm25 {
+        let rank = candidate
+            .bm25_rank
+            .unwrap_or(candidate.retrieval_rank)
+            .max(1);
+        let entry = merged.entry(candidate.id).or_insert_with(|| FusionEntry {
+            payload: candidate.payload,
+            dense_rank: None,
+            bm25_rank: None,
+            score: 0.0,
+        });
+        entry.bm25_rank = Some(rank);
+        entry.score += bm25_w * (1.0 / (k + rank as f32));
+    }
+
+    let mut ranked = merged.into_iter().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| b.1.score.total_cmp(&a.1.score));
+
+    ranked
+        .into_iter()
+        .take(limit.max(1))
+        .enumerate()
+        .map(|(idx, (id, item))| SearchCandidate {
+            id,
+            retrieval_score: item.score,
+            dense_rank: item.dense_rank,
+            bm25_rank: item.bm25_rank,
+            rrf_score: Some(item.score),
+            rerank_score: None,
+            retrieval_rank: idx + 1,
+            rerank_rank: None,
+            payload: item.payload,
+        })
+        .collect::<Vec<_>>()
+}
+
+fn postprocess_bm25_candidates(candidates: &mut [SearchCandidate], raw_query: &str) {
+    if candidates.is_empty() {
+        return;
+    }
+    let lower_query = raw_query.to_lowercase();
+    let howto_intent = is_howto_query(&lower_query);
+
+    for candidate in candidates.iter_mut() {
+        let source_md = payload_str(&candidate.payload, "source_md").to_lowercase();
+        let mut factor = 1.0f32;
+
+        if source_md.contains("_changelog_") {
+            factor *= 0.15;
+        }
+        if howto_intent && source_md.contains("platform__architecture") {
+            factor *= 0.6;
+        }
+        if howto_intent && source_md.contains("__reference__") {
+            factor *= 0.75;
+        }
+        if howto_intent
+            && (source_md.contains("sdk__tools")
+                || source_md.contains("sdk__app_development")
+                || source_md.contains("software_development__guides"))
+        {
+            factor *= 1.15;
+        }
+
+        candidate.retrieval_score *= factor;
+    }
+
+    candidates.sort_by(|a, b| b.retrieval_score.total_cmp(&a.retrieval_score));
+    for (idx, candidate) in candidates.iter_mut().enumerate() {
+        candidate.bm25_rank = Some(idx + 1);
+        candidate.retrieval_rank = idx + 1;
+    }
+}
+
+fn evaluate_answer_quality(
+    raw_query: &str,
+    doc_version: Option<&str>,
+    results: &[SearchResultOutput],
+) -> (String, Option<String>) {
+    if results.is_empty() {
+        let advisory = doc_version.map(|v| {
+            format!(
+                "No direct answer found in docs version {v}. Try broader query or another version."
+            )
+        });
+        return ("low".to_string(), advisory);
+    }
+
+    let profile = build_query_profile(raw_query);
+    if profile.tokens.is_empty() {
+        return ("medium".to_string(), None);
+    }
+
+    let mut max_coverage = 0.0f32;
+    let mut action_supported = profile.required_action.is_none();
+    let mut actionable_count = 0usize;
+
+    for result in results.iter().take(5) {
+        let rtokens = extract_canonical_tokens(&result_token_haystack(result));
+        let coverage = token_coverage(&profile.tokens, &rtokens);
+        if coverage > max_coverage {
+            max_coverage = coverage;
+        }
+        if is_actionable_result_source(result) {
+            actionable_count += 1;
+        }
+        if let Some(action) = &profile.required_action {
+            if action
+                .tokens
+                .iter()
+                .any(|token| token_present(&rtokens, token))
+            {
+                action_supported = true;
+            }
+        }
+    }
+
+    if !action_supported {
+        let advisory = doc_version.map(|v| {
+            format!(
+                "No source with matching action intent found in docs version {v}; results may be indirect."
+            )
+        });
+        return ("low".to_string(), advisory);
+    }
+
+    // Generic coverage gate: if query concepts are not co-located in any retrieved source, treat as low confidence.
+    if max_coverage < 0.58 {
+        let advisory = doc_version.map(|v| {
+            format!(
+                "No source with sufficient concept overlap found in docs version {v}; results may be indirect."
+            )
+        });
+        return ("low".to_string(), advisory);
+    }
+
+    if max_coverage >= 0.9 && actionable_count >= 2 {
+        return ("high".to_string(), None);
+    }
+    ("medium".to_string(), None)
+}
+
+fn parse_confidence_level(value: &str) -> ConfidenceLevel {
+    match value {
+        "high" => ConfidenceLevel::High,
+        "medium" => ConfidenceLevel::Medium,
+        _ => ConfidenceLevel::Low,
+    }
+}
+
+fn confidence_rank(level: ConfidenceLevel) -> u8 {
+    match level {
+        ConfidenceLevel::Low => 0,
+        ConfidenceLevel::Medium => 1,
+        ConfidenceLevel::High => 2,
+    }
+}
+
+fn build_no_knowledge_message(doc_version: Option<&str>) -> String {
+    if let Some(version) = doc_version.map(str::trim).filter(|v| !v.is_empty()) {
+        return format!(
+            "No sufficiently relevant sources found for docs version {version}. No knowledge returned."
+        );
+    }
+    "No sufficiently relevant sources found. No knowledge returned.".to_string()
+}
+
+fn is_howto_query(lower_query: &str) -> bool {
+    let markers = [
+        "как",
+        "how",
+        "установ",
+        "install",
+        "запуск",
+        "запустить",
+        "run",
+        "launch",
+        "собрат",
+        "build",
+        "подпис",
+        "sign",
+        "эмулятор",
+        "emulator",
+        "скриншот",
+        "screenshot",
+        "видео",
+        "video",
+    ];
+    markers.iter().any(|m| lower_query.contains(m))
+}
+
+#[derive(Debug, Clone)]
+struct QueryActionIntent {
+    tokens: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+struct QueryProfile {
+    tokens: Vec<String>,
+    required_action: Option<QueryActionIntent>,
+}
+
+fn build_query_profile(query: &str) -> QueryProfile {
+    let tokens = extract_canonical_tokens(query);
+    let required_action = if tokens
+        .iter()
+        .any(|t| t == "sign" || t == "install" || t == "build" || t == "launch")
+    {
+        let mut action_tokens = Vec::new();
+        if tokens.iter().any(|t| t == "sign") {
+            action_tokens.extend(["sign"]);
+        }
+        if tokens.iter().any(|t| t == "install") {
+            action_tokens.extend(["install"]);
+        }
+        if tokens.iter().any(|t| t == "build") {
+            action_tokens.extend(["build"]);
+        }
+        if tokens.iter().any(|t| t == "launch") {
+            action_tokens.extend(["launch"]);
+        }
+        Some(QueryActionIntent {
+            tokens: action_tokens,
+        })
+    } else if tokens.iter().any(|t| t == "record" || t == "screenshot") {
+        let mut action_tokens = Vec::new();
+        if tokens.iter().any(|t| t == "record") {
+            action_tokens.extend(["record"]);
+        }
+        if tokens.iter().any(|t| t == "screenshot") {
+            action_tokens.extend(["screenshot"]);
+        }
+        Some(QueryActionIntent {
+            tokens: action_tokens,
+        })
+    } else {
+        None
+    };
+    QueryProfile {
+        tokens,
+        required_action,
+    }
+}
+
+fn result_token_haystack(result: &SearchResultOutput) -> String {
+    let mut parts = Vec::new();
+    if let Some(title) = &result.source_title {
+        parts.push(title.as_str());
+    }
+    if let Some(path) = &result.source_md {
+        parts.push(path.as_str());
+    }
+    if let Some(content) = &result.content {
+        parts.push(content.as_str());
+    }
+    parts.join(" ")
+}
+
+fn extract_canonical_tokens(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in text.split(|ch: char| !ch.is_alphanumeric()) {
+        let Some(token) = canonicalize_token(raw) else {
+            continue;
+        };
+        if seen.insert(token.clone()) {
+            out.push(token);
+        }
+    }
+    out
+}
+
+fn canonicalize_token(raw: &str) -> Option<String> {
+    let t = raw.trim().to_lowercase();
+    if t.is_empty() {
+        return None;
+    }
+
+    let mapped = if t.contains("эмулят") || t == "emulator" || t == "emulation" {
+        "emulator"
+    } else if t == "рпм" || t == "rpm" || t.starts_with("пакет") || t.starts_with("package")
+    {
+        "rpm"
+    } else if t.starts_with("подпис")
+        || t.starts_with("sign")
+        || t.starts_with("signature")
+        || t.starts_with("rpmsign")
+    {
+        "sign"
+    } else if t.starts_with("устан")
+        || t.starts_with("install")
+        || t.starts_with("deploy")
+        || t.starts_with("развер")
+    {
+        "install"
+    } else if t.starts_with("собр") || t.starts_with("build") || t == "mb2" {
+        "build"
+    } else if t.starts_with("запус")
+        || t.starts_with("launch")
+        || t == "run"
+        || t == "start"
+        || t == "cli"
+        || t == "terminal"
+        || t.starts_with("терминал")
+    {
+        "launch"
+    } else if t.starts_with("скрин") || t.starts_with("screenshot") || t.starts_with("screengrab")
+    {
+        "screenshot"
+    } else if t.starts_with("запис") || t == "record" || t == "capture" {
+        "record"
+    } else if t.starts_with("видео") || t == "video" {
+        "video"
+    } else {
+        let stop = [
+            "как", "и", "в", "на", "из", "по", "для", "с", "или", "the", "a", "an", "to", "of",
+        ];
+        if stop.contains(&t.as_str()) {
+            return None;
+        }
+        if t.chars().count() < 3 {
+            return None;
+        }
+        return Some(t);
+    };
+    Some(mapped.to_string())
+}
+
+fn token_coverage(query_tokens: &[String], result_tokens: &[String]) -> f32 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let matched = query_tokens
+        .iter()
+        .filter(|qt| token_present(result_tokens, qt))
+        .count();
+    matched as f32 / query_tokens.len() as f32
+}
+
+fn token_present(tokens: &[String], needle: &str) -> bool {
+    tokens.iter().any(|t| t == needle)
+}
+
+fn is_actionable_result_source(result: &SearchResultOutput) -> bool {
+    let Some(source_md) = result.source_md.as_deref() else {
+        return false;
+    };
+    let path = source_md.to_lowercase();
+    path.contains("sdk__tools")
+        || path.contains("sdk__app_development")
+        || path.contains("software_development__guides")
+}
+
+fn payload_str(payload: &Value, key: &str) -> String {
+    payload
+        .as_object()
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn search_qdrant(
@@ -879,6 +1765,9 @@ mod tests {
         SearchCandidate {
             id: id.to_string(),
             retrieval_score: score,
+            dense_rank: None,
+            bm25_rank: None,
+            rrf_score: None,
             rerank_score: None,
             retrieval_rank: 1,
             rerank_rank: None,
@@ -893,9 +1782,10 @@ mod tests {
 
     #[test]
     fn rerank_flag_resolution() {
-        assert!(!resolve_rerank_enabled(false, false));
-        assert!(resolve_rerank_enabled(true, false));
-        assert!(!resolve_rerank_enabled(true, true));
+        assert!(!resolve_rerank_enabled(false, false, false));
+        assert!(resolve_rerank_enabled(false, false, true));
+        assert!(resolve_rerank_enabled(true, false, false));
+        assert!(!resolve_rerank_enabled(true, true, true));
     }
 
     #[test]
@@ -991,5 +1881,52 @@ mod tests {
         assert_eq!(out[0].rerank_rank, Some(1));
         assert_eq!(out[1].id, "a");
         assert_eq!(out[2].id, "c");
+    }
+
+    #[test]
+    fn rrf_fusion_combines_dense_and_bm25_ranks() {
+        let mut dense_a = candidate("a", 0.9, "A");
+        dense_a.dense_rank = Some(1);
+        dense_a.retrieval_rank = 1;
+        let mut dense_b = candidate("b", 0.8, "B");
+        dense_b.dense_rank = Some(2);
+        dense_b.retrieval_rank = 2;
+
+        let mut bm25_a = candidate("a", 11.0, "A");
+        bm25_a.bm25_rank = Some(4);
+        bm25_a.retrieval_rank = 4;
+        let mut bm25_c = candidate("c", 12.0, "C");
+        bm25_c.bm25_rank = Some(1);
+        bm25_c.retrieval_rank = 1;
+
+        let out = fuse_rrf(
+            vec![dense_a, dense_b],
+            vec![bm25_a, bm25_c],
+            60,
+            1.0,
+            0.55,
+            10,
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0].id, "a");
+        assert_eq!(out[0].dense_rank, Some(1));
+        assert_eq!(out[0].bm25_rank, Some(4));
+        assert!(out[0].rrf_score.is_some());
+    }
+
+    #[test]
+    fn retrieval_mode_value_enum_parses_cli_tokens() {
+        assert_eq!(
+            RetrievalMode::from_str("hybrid", true).unwrap(),
+            RetrievalMode::Hybrid
+        );
+        assert_eq!(
+            RetrievalMode::from_str("dense", true).unwrap(),
+            RetrievalMode::Dense
+        );
+        assert_eq!(
+            RetrievalMode::from_str("bm25", true).unwrap(),
+            RetrievalMode::Bm25
+        );
     }
 }

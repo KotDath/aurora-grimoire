@@ -1,0 +1,37 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: aurora-grimoire-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_storage:/qdrant/storage
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aurora-grimoire-ollama
+    environment:
+      OLLAMA_VULKAN: ${OLLAMA_VULKAN:-1}
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    restart: unless-stopped
+
+  rerank:
+    build:
+      context: ./rerank-service
+      dockerfile: Dockerfile
+    image: aurora-grimoire-rerank:latest
+    container_name: aurora-grimoire-rerank
+    environment:
+      RERANK_MODEL: ${RERANK_MODEL:-BAAI/bge-reranker-v2-m3}
+    ports:
+      - "8081:8081"
+    restart: unless-stopped
+
+volumes:
+  qdrant_storage:
+  ollama_storage:

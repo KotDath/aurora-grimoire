@@ -1,4 +1,8 @@
 use super::RagEmbedArgs;
+use crate::config::{
+    AppConfig, DEFAULT_EMBED_BATCH_SIZE, DEFAULT_EMBED_MODEL, DEFAULT_EMBED_WORKERS,
+    DEFAULT_OLLAMA_URL,
+};
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -72,17 +76,34 @@ struct EmbedManifest {
 
 pub fn run(args: RagEmbedArgs) -> Result<()> {
     let verbose = args.verbose;
-    let batch_size = args.batch_size.max(1);
-    let workers = args.workers.max(1);
-
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory for embed"))?;
+    let cfg = AppConfig::load()?;
+    let batch_size = args
+        .batch_size
+        .or(cfg.embed.batch_size)
+        .unwrap_or(DEFAULT_EMBED_BATCH_SIZE)
+        .max(1);
+    let workers = args
+        .workers
+        .or(cfg.embed.workers)
+        .unwrap_or(DEFAULT_EMBED_WORKERS)
+        .max(1);
+    let ollama_url = args
+        .ollama_url
+        .clone()
+        .or_else(|| cfg.embed.ollama_url.clone())
+        .unwrap_or_else(|| DEFAULT_OLLAMA_URL.to_string());
+    let model = args
+        .model
+        .clone()
+        .or_else(|| cfg.embed.model.clone())
+        .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string());
+    let data_root = cfg.data_root()?;
     let input_root = args
         .input
-        .unwrap_or_else(|| home_dir.join(".aurora-grimoire").join(CHUNKS_ROOT_DIRNAME));
+        .unwrap_or_else(|| data_root.join(CHUNKS_ROOT_DIRNAME));
     let output_root = args
         .output
-        .unwrap_or_else(|| home_dir.join(".aurora-grimoire").join(VECTORS_ROOT_DIRNAME));
+        .unwrap_or_else(|| data_root.join(VECTORS_ROOT_DIRNAME));
 
     if !input_root.exists() {
         return Err(anyhow!(
@@ -212,8 +233,8 @@ pub fn run(args: RagEmbedArgs) -> Result<()> {
             if pending_window.len() >= window_target {
                 let produced = process_window(
                     &client,
-                    &args.ollama_url,
-                    &args.model,
+                    &ollama_url,
+                    &model,
                     batch_size,
                     workers,
                     std::mem::take(&mut pending_window),
@@ -258,8 +279,8 @@ pub fn run(args: RagEmbedArgs) -> Result<()> {
     if !pending_window.is_empty() {
         let produced = process_window(
             &client,
-            &args.ollama_url,
-            &args.model,
+            &ollama_url,
+            &model,
             batch_size,
             workers,
             pending_window,
@@ -319,8 +340,8 @@ pub fn run(args: RagEmbedArgs) -> Result<()> {
         finished_at: now_rfc3339(),
         input_root: input_root.to_string_lossy().to_string(),
         output_root: output_root.to_string_lossy().to_string(),
-        ollama_url: args.ollama_url,
-        embedding_model: args.model,
+        ollama_url,
+        embedding_model: model,
         batch_size,
         workers,
         chunks_total,

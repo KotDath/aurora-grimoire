@@ -1,6 +1,9 @@
 use super::{
     RagDevArgs, RagDevCommand, RagDevDownArgs, RagDevLogsArgs, RagDevStatusArgs, RagDevUpArgs,
 };
+use crate::config::{
+    AppConfig, DEFAULT_DEV_WAIT_TIMEOUT_SEC, DEFAULT_EMBED_MODEL, DEFAULT_RERANK_MODEL,
+};
 use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use std::{
@@ -12,7 +15,6 @@ use std::{
 };
 
 const PROJECT_NAME: &str = "aurora_grimoire_dev";
-const DEFAULT_RERANK_MODEL: &str = "BAAI/bge-reranker-v2-m3";
 
 macro_rules! vprintln {
     ($verbose:expr, $($arg:tt)*) => {
@@ -32,10 +34,23 @@ pub fn run(args: RagDevArgs) -> Result<()> {
 }
 
 fn run_up(args: RagDevUpArgs) -> Result<()> {
+    let cfg = AppConfig::load()?;
+    let with_rerank = args.with_rerank || cfg.dev.with_rerank.unwrap_or(false);
+    let model = args
+        .model
+        .clone()
+        .or_else(|| cfg.dev.model.clone())
+        .unwrap_or_else(|| DEFAULT_EMBED_MODEL.to_string());
+    let wait_timeout_sec = args
+        .wait_timeout_sec
+        .or(cfg.dev.wait_timeout_sec)
+        .unwrap_or(DEFAULT_DEV_WAIT_TIMEOUT_SEC)
+        .max(1);
+
     let compose_files = compose_file_paths(args.gpu)?;
     assert_docker_ready()?;
     let mut services = vec!["qdrant".to_string(), "ollama".to_string()];
-    if args.with_rerank {
+    if with_rerank {
         services.push("rerank".to_string());
     }
 
@@ -63,20 +78,20 @@ fn run_up(args: RagDevUpArgs) -> Result<()> {
     wait_for_http_ready(
         "Qdrant",
         "http://127.0.0.1:6333/collections",
-        args.wait_timeout_sec,
+        wait_timeout_sec,
         args.verbose,
     )?;
     wait_for_http_ready(
         "Ollama",
         "http://127.0.0.1:11434/api/tags",
-        args.wait_timeout_sec,
+        wait_timeout_sec,
         args.verbose,
     )?;
-    if args.with_rerank {
+    if with_rerank {
         wait_for_http_ready(
             "Rerank",
             "http://127.0.0.1:8081/health",
-            args.wait_timeout_sec,
+            wait_timeout_sec,
             args.verbose,
         )?;
     }
@@ -94,17 +109,17 @@ fn run_up(args: RagDevUpArgs) -> Result<()> {
             "ollama".to_string(),
             "ollama".to_string(),
             "pull".to_string(),
-            args.model.clone(),
+            model.clone(),
         ]);
         run_cmd("docker", &pull_args, args.verbose).with_context(|| {
             format!(
                 "failed to pull embedding model '{}' into ollama container",
-                args.model
+                model
             )
         })?;
     }
 
-    if args.with_rerank {
+    if with_rerank {
         println!(
             "RAG dev stack is up (qdrant=6333, ollama=11434, rerank=8081, rerank_model={})",
             env::var("RERANK_MODEL").unwrap_or_else(|_| DEFAULT_RERANK_MODEL.to_string())

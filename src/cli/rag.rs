@@ -1,5 +1,7 @@
 mod bundle;
 mod chunk_md;
+mod clear;
+mod config_cmd;
 mod deploy;
 mod dev;
 mod embed;
@@ -18,6 +20,9 @@ pub struct RagArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum RagCommand {
+    /// Initialize/manage CLI config
+    Config(RagConfigArgs),
+
     /// Recursively fetch HTML documentation
     #[command(name = "fetch-web", visible_alias = "fetch_web")]
     FetchWeb(RagFetchWebArgs),
@@ -57,6 +62,25 @@ pub struct RagFetchWebArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct RagConfigArgs {
+    #[command(subcommand)]
+    pub command: RagConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RagConfigCommand {
+    /// Create default config.toml
+    Init(RagConfigInitArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct RagConfigInitArgs {
+    /// Overwrite existing config file
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct RagStructArgs {
     /// Verbose converter logs
     #[arg(short, long, default_value_t = false)]
@@ -77,20 +101,20 @@ pub struct RagEmbedArgs {
     pub verbose: bool,
 
     /// Ollama base URL
-    #[arg(long, default_value = "http://127.0.0.1:11434")]
-    pub ollama_url: String,
+    #[arg(long)]
+    pub ollama_url: Option<String>,
 
     /// Embedding model name
-    #[arg(long, default_value = "qwen3-embedding:0.6b")]
-    pub model: String,
+    #[arg(long)]
+    pub model: Option<String>,
 
     /// Number of chunks per embedding batch
-    #[arg(long, default_value_t = 16)]
-    pub batch_size: usize,
+    #[arg(long)]
+    pub batch_size: Option<usize>,
 
     /// Parallel embedding workers
-    #[arg(long, default_value_t = 2)]
-    pub workers: usize,
+    #[arg(long)]
+    pub workers: Option<usize>,
 
     /// Chunk source directory
     #[arg(long)]
@@ -112,24 +136,24 @@ pub struct RagDeployArgs {
     pub verbose: bool,
 
     /// Qdrant base URL
-    #[arg(long, default_value = "http://127.0.0.1:6333")]
-    pub url: String,
+    #[arg(long)]
+    pub url: Option<String>,
 
     /// Qdrant API key
     #[arg(long)]
     pub api_key: Option<String>,
 
     /// Collection/index in the vector store
-    #[arg(long, default_value = "aurora_docs_qwen3_embedding_0_6b")]
-    pub collection: String,
+    #[arg(long)]
+    pub collection: Option<String>,
 
     /// Input vectors directory or bundle file
     #[arg(long)]
     pub input: Option<PathBuf>,
 
     /// Number of points per upsert batch
-    #[arg(long, default_value_t = 256)]
-    pub batch_size: usize,
+    #[arg(long)]
+    pub batch_size: Option<usize>,
 
     /// Recreate collection before upload
     #[arg(long, default_value_t = false)]
@@ -161,10 +185,6 @@ pub struct RagBundleCreateArgs {
     /// Verbose bundle logs
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,
-
-    /// Bundle type: chunks, vectors or dual
-    #[arg(long = "type", default_value = "dual")]
-    pub bundle_type: String,
 
     /// Input chunks directory
     #[arg(long)]
@@ -238,16 +258,16 @@ pub struct RagDevUpArgs {
     pub with_rerank: bool,
 
     /// Embedding model to pull into Ollama
-    #[arg(long, default_value = "qwen3-embedding:0.6b")]
-    pub model: String,
+    #[arg(long)]
+    pub model: Option<String>,
 
     /// Skip model pull in Ollama
     #[arg(long, default_value_t = false)]
     pub skip_model_pull: bool,
 
     /// Wait timeout in seconds for services to become healthy
-    #[arg(long, default_value_t = 240)]
-    pub wait_timeout_sec: u64,
+    #[arg(long)]
+    pub wait_timeout_sec: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -298,28 +318,28 @@ pub struct RagTestE2eArgs {
     pub verbose: bool,
 
     /// Search query used for smoke test
-    #[arg(long, default_value = "how to work with dbus in aurora os")]
-    pub query: String,
+    #[arg(long)]
+    pub query: Option<String>,
 
     /// Optional docs version filter for search_docs
     #[arg(long = "doc-version")]
     pub doc_version: Option<String>,
 
     /// Number of results
-    #[arg(long, default_value_t = 5)]
-    pub top_k: usize,
+    #[arg(long)]
+    pub top_k: Option<usize>,
 
     /// Enable rerank during smoke query
     #[arg(long, default_value_t = false)]
     pub rerank: bool,
 
     /// Qdrant base URL
-    #[arg(long, default_value = "http://127.0.0.1:6333")]
-    pub qdrant_url: String,
+    #[arg(long)]
+    pub qdrant_url: Option<String>,
 
     /// Collection name
-    #[arg(long, default_value = "aurora_docs_qwen3_embedding_0_6b")]
-    pub collection: String,
+    #[arg(long)]
+    pub collection: Option<String>,
 
     /// Skip embed step
     #[arg(long, default_value_t = false)]
@@ -359,6 +379,12 @@ pub struct RagClearArgs {
 
 pub fn run(args: RagArgs) {
     match args.command {
+        RagCommand::Config(config_args) => {
+            if let Err(err) = config_cmd::run(config_args) {
+                eprintln!("[error] rag config failed: {err:#}");
+                std::process::exit(1);
+            }
+        }
         RagCommand::FetchWeb(fetch) => {
             if let Err(err) = fetch_web::run(fetch) {
                 eprintln!("[error] rag fetch-web failed: {err:#}");
@@ -408,7 +434,10 @@ pub fn run(args: RagArgs) {
             }
         }
         RagCommand::Clear(clear) => {
-            println!("[stub] rag clear: {clear:#?}");
+            if let Err(err) = clear::run(clear) {
+                eprintln!("[error] rag clear failed: {err:#}");
+                std::process::exit(1);
+            }
         }
     }
 }

@@ -1,16 +1,34 @@
 use super::{RagDeployArgs, RagEmbedArgs, RagTestE2eArgs, deploy, embed};
+use crate::config::{AppConfig, DEFAULT_COLLECTION, DEFAULT_QDRANT_URL, DEFAULT_TEST_E2E_QUERY};
 use anyhow::{Context, Result, anyhow};
 use serde_json::Value;
 use std::process::Command;
 
 pub fn run(args: RagTestE2eArgs) -> Result<()> {
+    let cfg = AppConfig::load()?;
+    let qdrant_url = args
+        .qdrant_url
+        .clone()
+        .or_else(|| cfg.deploy.qdrant_url.clone())
+        .unwrap_or_else(|| DEFAULT_QDRANT_URL.to_string());
+    let collection = args
+        .collection
+        .clone()
+        .or_else(|| cfg.deploy.collection.clone())
+        .unwrap_or_else(|| DEFAULT_COLLECTION.to_string());
+    let query = args
+        .query
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TEST_E2E_QUERY.to_string());
+    let top_k = args.top_k.unwrap_or(5).max(1);
+
     if !args.skip_embed {
         embed::run(RagEmbedArgs {
             verbose: args.verbose,
-            ollama_url: "http://127.0.0.1:11434".to_string(),
-            model: "qwen3-embedding:0.6b".to_string(),
-            batch_size: 16,
-            workers: 2,
+            ollama_url: None,
+            model: None,
+            batch_size: None,
+            workers: None,
             input: None,
             output: None,
             resume: false,
@@ -21,11 +39,11 @@ pub fn run(args: RagTestE2eArgs) -> Result<()> {
     if !args.skip_deploy {
         deploy::run(RagDeployArgs {
             verbose: args.verbose,
-            url: args.qdrant_url.clone(),
+            url: Some(qdrant_url.clone()),
             api_key: None,
-            collection: args.collection.clone(),
+            collection: Some(collection.clone()),
             input: None,
-            batch_size: 256,
+            batch_size: None,
             recreate: args.recreate,
             from_bundle: false,
         })
@@ -36,13 +54,13 @@ pub fn run(args: RagTestE2eArgs) -> Result<()> {
     let mut cmd = Command::new(exe);
     cmd.arg("cli")
         .arg("search_docs")
-        .arg(&args.query)
+        .arg(&query)
         .arg("--top-k")
-        .arg(args.top_k.max(1).to_string())
+        .arg(top_k.to_string())
         .arg("--qdrant-url")
-        .arg(&args.qdrant_url)
+        .arg(&qdrant_url)
         .arg("--collection")
-        .arg(&args.collection)
+        .arg(&collection)
         .arg("--json");
 
     if let Some(version) = &args.doc_version {

@@ -1,4 +1,5 @@
 use super::RagChunkArgs;
+use crate::config::AppConfig;
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -182,10 +183,9 @@ pub fn run(args: RagChunkArgs) -> Result<()> {
         shard_max_records: SHARD_MAX_RECORDS,
     };
 
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory for chunk"))?;
-    let input_root = home_dir.join(".aurora-grimoire").join(MD_ROOT_DIRNAME);
-    let output_root = home_dir.join(".aurora-grimoire").join(CHUNKS_ROOT_DIRNAME);
+    let home_dir = AppConfig::load()?.data_root()?;
+    let input_root = home_dir.join(MD_ROOT_DIRNAME);
+    let output_root = home_dir.join(CHUNKS_ROOT_DIRNAME);
 
     if !input_root.exists() {
         return Err(anyhow!(

@@ -1,4 +1,5 @@
 use super::RagDeployArgs;
+use crate::config::{AppConfig, DEFAULT_COLLECTION, DEFAULT_DEPLOY_BATCH_SIZE, DEFAULT_QDRANT_URL};
 use anyhow::{Context, Result, anyhow};
 use indicatif::{ProgressBar, ProgressStyle};
 use reqwest::{Method, StatusCode, blocking::Client};
@@ -43,11 +44,26 @@ impl Drop for TempExtractDir {
 
 pub fn run(args: RagDeployArgs) -> Result<()> {
     let verbose = args.verbose;
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory for deploy"))?;
+    let cfg = AppConfig::load()?;
+    let data_root = cfg.data_root()?;
     let input = args
         .input
-        .unwrap_or_else(|| home_dir.join(".aurora-grimoire").join(VECTORS_ROOT_DIRNAME));
+        .unwrap_or_else(|| data_root.join(VECTORS_ROOT_DIRNAME));
+    let qdrant_url = args
+        .url
+        .clone()
+        .or_else(|| cfg.deploy.qdrant_url.clone())
+        .unwrap_or_else(|| DEFAULT_QDRANT_URL.to_string());
+    let collection = args
+        .collection
+        .clone()
+        .or_else(|| cfg.deploy.collection.clone())
+        .unwrap_or_else(|| DEFAULT_COLLECTION.to_string());
+    let batch_size = args
+        .batch_size
+        .or(cfg.deploy.batch_size)
+        .unwrap_or(DEFAULT_DEPLOY_BATCH_SIZE)
+        .max(1);
 
     let api_key = args.api_key.or_else(|| env::var("QDRANT_API_KEY").ok());
 
@@ -105,18 +121,18 @@ pub fn run(args: RagDeployArgs) -> Result<()> {
 
     ensure_collection(
         &client,
-        &args.url,
+        &qdrant_url,
         api_key.as_deref(),
-        &args.collection,
+        &collection,
         dim,
         args.recreate,
         verbose,
     )?;
     ensure_payload_indexes(
         &client,
-        &args.url,
+        &qdrant_url,
         api_key.as_deref(),
-        &args.collection,
+        &collection,
         verbose,
     )?;
 
@@ -133,7 +149,7 @@ pub fn run(args: RagDeployArgs) -> Result<()> {
     };
 
     let mut uploaded = 0usize;
-    let mut points_batch: Vec<Value> = Vec::with_capacity(args.batch_size.max(1));
+    let mut points_batch: Vec<Value> = Vec::with_capacity(batch_size);
     for path in &vector_files {
         let file = File::open(path)
             .with_context(|| format!("failed to open vector shard {}", path.display()))?;
@@ -165,12 +181,12 @@ pub fn run(args: RagDeployArgs) -> Result<()> {
             });
             points_batch.push(point);
 
-            if points_batch.len() >= args.batch_size.max(1) {
+            if points_batch.len() >= batch_size {
                 upsert_points(
                     &client,
-                    &args.url,
+                    &qdrant_url,
                     api_key.as_deref(),
-                    &args.collection,
+                    &collection,
                     &points_batch,
                 )?;
                 uploaded += points_batch.len();
@@ -185,9 +201,9 @@ pub fn run(args: RagDeployArgs) -> Result<()> {
     if !points_batch.is_empty() {
         upsert_points(
             &client,
-            &args.url,
+            &qdrant_url,
             api_key.as_deref(),
-            &args.collection,
+            &collection,
             &points_batch,
         )?;
         uploaded += points_batch.len();
@@ -202,7 +218,7 @@ pub fn run(args: RagDeployArgs) -> Result<()> {
 
     println!(
         "{} vectors uploaded to {} at {}",
-        uploaded, args.collection, args.url
+        uploaded, collection, qdrant_url
     );
 
     drop(extracted);

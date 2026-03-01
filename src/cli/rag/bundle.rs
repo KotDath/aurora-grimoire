@@ -2,6 +2,7 @@ use super::{
     RagBundleArgs, RagBundleCommand, RagBundleCreateArgs, RagBundleExtractArgs,
     RagBundleInspectArgs,
 };
+use crate::config::AppConfig;
 use anyhow::{Context, Result, anyhow};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use std::{
 const CHUNKS_ROOT_DIRNAME: &str = "chunks";
 const VECTORS_ROOT_DIRNAME: &str = "vectors_data";
 const SCHEMA_VERSION: &str = "1";
+const BUNDLE_TYPE_DUAL: &str = "dual";
 
 macro_rules! vprintln {
     ($verbose:expr, $($arg:tt)*) => {
@@ -23,47 +25,6 @@ macro_rules! vprintln {
             println!($($arg)*);
         }
     };
-}
-
-#[derive(Debug, Clone, Copy)]
-enum BundleType {
-    Chunks,
-    Vectors,
-    Dual,
-}
-
-impl BundleType {
-    fn as_str(self) -> &'static str {
-        match self {
-            BundleType::Chunks => "chunks",
-            BundleType::Vectors => "vectors",
-            BundleType::Dual => "dual",
-        }
-    }
-
-    fn include_chunks(self) -> bool {
-        matches!(self, BundleType::Chunks | BundleType::Dual)
-    }
-
-    fn include_vectors(self) -> bool {
-        matches!(self, BundleType::Vectors | BundleType::Dual)
-    }
-}
-
-impl std::str::FromStr for BundleType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "chunks" => Ok(BundleType::Chunks),
-            "vectors" => Ok(BundleType::Vectors),
-            "dual" => Ok(BundleType::Dual),
-            other => Err(anyhow!(
-                "unsupported bundle type '{}', expected one of: chunks, vectors, dual",
-                other
-            )),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -103,24 +64,22 @@ pub fn run(args: RagBundleArgs) -> Result<()> {
 
 fn run_create(args: RagBundleCreateArgs) -> Result<()> {
     let verbose = args.verbose;
-    let bundle_type = args.bundle_type.parse::<BundleType>()?;
 
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory for bundle"))?;
+    let data_root = AppConfig::load()?.data_root()?;
     let chunks_root = args
         .input_chunks
-        .unwrap_or_else(|| home_dir.join(".aurora-grimoire").join(CHUNKS_ROOT_DIRNAME));
+        .unwrap_or_else(|| data_root.join(CHUNKS_ROOT_DIRNAME));
     let vectors_root = args
         .input_vectors
-        .unwrap_or_else(|| home_dir.join(".aurora-grimoire").join(VECTORS_ROOT_DIRNAME));
+        .unwrap_or_else(|| data_root.join(VECTORS_ROOT_DIRNAME));
 
-    if bundle_type.include_chunks() && !chunks_root.exists() {
+    if !chunks_root.exists() {
         return Err(anyhow!(
             "chunks directory does not exist: {}",
             chunks_root.display()
         ));
     }
-    if bundle_type.include_vectors() && !vectors_root.exists() {
+    if !vectors_root.exists() {
         return Err(anyhow!(
             "vectors directory does not exist: {}",
             vectors_root.display()
@@ -128,34 +87,22 @@ fn run_create(args: RagBundleCreateArgs) -> Result<()> {
     }
 
     let mut source_files = Vec::new();
-    if bundle_type.include_chunks() {
-        collect_source_files(
-            &chunks_root,
-            Path::new("chunks"),
-            &mut source_files,
-            verbose,
-        )?;
-    }
-    if bundle_type.include_vectors() {
-        collect_source_files(
-            &vectors_root,
-            Path::new("vectors"),
-            &mut source_files,
-            verbose,
-        )?;
-    }
+    collect_source_files(
+        &chunks_root,
+        Path::new("chunks"),
+        &mut source_files,
+        verbose,
+    )?;
+    collect_source_files(
+        &vectors_root,
+        Path::new("vectors"),
+        &mut source_files,
+        verbose,
+    )?;
     source_files.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
 
-    let chunks_manifest = if bundle_type.include_chunks() {
-        read_optional_json(chunks_root.join("manifest.json"))?
-    } else {
-        None
-    };
-    let vectors_manifest = if bundle_type.include_vectors() {
-        read_optional_json(vectors_root.join("manifest.json"))?
-    } else {
-        None
-    };
+    let chunks_manifest = read_optional_json(chunks_root.join("manifest.json"))?;
+    let vectors_manifest = read_optional_json(vectors_root.join("manifest.json"))?;
 
     let files = source_files
         .iter()
@@ -168,7 +115,7 @@ fn run_create(args: RagBundleCreateArgs) -> Result<()> {
     let bytes_total = source_files.iter().map(|file| file.size_bytes).sum::<u64>();
     let manifest = BundleManifest {
         schema_version: SCHEMA_VERSION.to_string(),
-        bundle_type: bundle_type.as_str().to_string(),
+        bundle_type: BUNDLE_TYPE_DUAL.to_string(),
         created_at: now_rfc3339(),
         chunks_manifest,
         vectors_manifest,
@@ -223,7 +170,7 @@ fn run_create(args: RagBundleCreateArgs) -> Result<()> {
     println!(
         "Bundle created: {} (type={}, size={})",
         args.out.display(),
-        bundle_type.as_str(),
+        BUNDLE_TYPE_DUAL,
         size_bytes
     );
     Ok(())
@@ -240,11 +187,8 @@ fn run_inspect(args: RagBundleInspectArgs) -> Result<()> {
 
 fn run_extract(args: RagBundleExtractArgs) -> Result<()> {
     let verbose = args.verbose;
-    let home_dir =
-        dirs::home_dir().ok_or_else(|| anyhow!("failed to resolve home directory for extract"))?;
-    let output_root = args
-        .out
-        .unwrap_or_else(|| home_dir.join(".aurora-grimoire"));
+    let data_root = AppConfig::load()?.data_root()?;
+    let output_root = args.out.unwrap_or(data_root);
     fs::create_dir_all(&output_root).with_context(|| {
         format!(
             "failed to create extraction root directory {}",

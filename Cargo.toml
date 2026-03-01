@@ -18,3 +18,9 @@ ego-tree = "0.10.0"
 indicatif = "0.17.11"
 tar = "0.4.44"
 zstd = "0.13.3"
+tantivy = "0.22.0"
+rmcp = { version = "0.17.0", default-features = false, features = ["server", "client", "macros", "transport-io", "transport-streamable-http-server", "transport-child-process"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "signal", "io-std"] }
+tokio-util = "0.7"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+toml = "0.8"
