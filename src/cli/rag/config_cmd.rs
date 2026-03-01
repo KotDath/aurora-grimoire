@@ -27,7 +27,7 @@ fn run_init(args: RagConfigInitArgs) -> Result<()> {
         })?;
     }
 
-    let template = include_str!("../../../docs/config.example.toml");
+    let template = include_str!("../../../config.example.toml");
     fs::write(&config_path, template).with_context(|| {
         format!(
             "failed to write config template to {}",

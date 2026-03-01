@@ -71,7 +71,7 @@ aurora-grimoire rag config init --force
 AURORA_GRIMOIRE_CONFIG=/path/to/config.toml aurora-grimoire rag config init
 ```
 
-Шаблон конфига: [`docs/config.example.toml`](docs/config.example.toml)
+Шаблон конфига: [`config.example.toml`](config.example.toml)
 
 ## Быстрый старт (end-to-end)
 

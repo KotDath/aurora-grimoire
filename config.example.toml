@@ -1,0 +1,48 @@
+# Aurora Grimoire configuration example
+# Copy to ~/.aurora-grimoire/config.toml
+# or set AURORA_GRIMOIRE_CONFIG=/path/to/config.toml
+
+[storage]
+# root_dir = "~/.aurora-grimoire"
+
+[embed]
+ollama_url = "http://127.0.0.1:11434"
+model = "qwen3-embedding:0.6b"
+batch_size = 16
+workers = 2
+
+[deploy]
+qdrant_url = "http://127.0.0.1:6333"
+collection = "aurora_docs_qwen3_embedding_0_6b"
+batch_size = 256
+
+[search]
+top_k = 10
+score_threshold = 0.0
+retrieval_mode = "hybrid"       # hybrid | dense | bm25
+knowledge_threshold = "medium"  # low | medium | high
+top_n = 60
+bm25_top_n = 300
+rrf_k = 60
+dense_weight = 1.0
+bm25_weight = 0.55
+qdrant_url = "http://127.0.0.1:6333"
+collection = "aurora_docs_qwen3_embedding_0_6b"
+ollama_url = "http://127.0.0.1:11434"
+model = "qwen3-embedding:0.6b"
+rerank_enabled = false
+rerank_url = "http://127.0.0.1:8081"
+rerank_model = "BAAI/bge-reranker-v2-m3"
+rerank_timeout_ms = 30000
+rerank_fail_open = true
+# bm25_data_dir = "~/.aurora-grimoire/bm25_data"
+# chunks_dir = "~/.aurora-grimoire/chunks"
+
+[dev]
+model = "qwen3-embedding:0.6b"
+wait_timeout_sec = 240
+with_rerank = false
+
+[mcp]
+host = "127.0.0.1"
+port = 8080

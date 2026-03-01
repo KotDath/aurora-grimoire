@@ -71,7 +71,7 @@ Custom config path:
 AURORA_GRIMOIRE_CONFIG=/path/to/config.toml aurora-grimoire rag config init
 ```
 
-Config template: [`docs/config.example.toml`](docs/config.example.toml)
+Config template: [`config.example.toml`](config.example.toml)
 
 ## Quick Start (end-to-end)
 
